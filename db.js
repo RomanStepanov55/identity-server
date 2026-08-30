@@ -23,6 +23,7 @@ export async function initDb() {
       phone_hint TEXT NOT NULL,
       username TEXT UNIQUE,
       vault_password_hash TEXT,
+      telegram_chat_id BIGINT,
       is_banned BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -34,6 +35,12 @@ export async function initDb() {
       attempts INTEGER DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS telegram_link_codes (
+      code TEXT PRIMARY KEY,
+      phone_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS vault_items (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES identities(id),
@@ -42,6 +49,8 @@ export async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  await pool.query(`ALTER TABLE identities ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT;`);
 
   if (!process.env.INTERNAL_API_KEY) {
     console.warn("⚠️  INTERNAL_API_KEY не задан — этот сервер НЕЛЬЗЯ включать без него, любой сможет читать телефоны!");

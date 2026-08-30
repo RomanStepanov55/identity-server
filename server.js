@@ -7,6 +7,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { pool, initDb, ADMIN_PHONE } from "./db.js";
 import { hashPhone, encryptPhone, decryptPhone, maskPhone, deriveVaultKey, encryptWithKey, decryptWithKey } from "./crypto.js";
+import { isTelegramConfigured, telegramDeepLink, registerWebhookIfNeeded, sendTelegramMessage, WEBHOOK_SECRET } from "./telegram.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "change-me-in-production";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
@@ -37,8 +38,81 @@ function internalOnly(req, res, next) {
 }
 app.use("/internal", internalOnly);
 
+// ---------------------------------------------------------------------
+// Единственный публичный роут этого сервера — сюда стучится сам Telegram,
+// у которого нет и не может быть internal-ключа. Защищён отдельным
+// секретом, который знает только Telegram (проверяется в заголовке).
+// ---------------------------------------------------------------------
+app.post("/telegram/webhook", async (req, res) => {
+  if (req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) return res.status(403).end();
+  try {
+    const msg = req.body?.message;
+    if (msg?.text?.startsWith("/start")) {
+      const parts = msg.text.trim().split(/\s+/);
+      const code = parts[1];
+      if (code) {
+        const r = await pool.query("SELECT phone_hash FROM telegram_link_codes WHERE code = $1 AND expires_at > NOW()", [code]);
+        if (r.rows.length) {
+          await pool.query("UPDATE identities SET telegram_chat_id = $1 WHERE phone_hash = $2", [msg.chat.id, r.rows[0].phone_hash]);
+          await pool.query("DELETE FROM telegram_link_codes WHERE code = $1", [code]);
+          await sendTelegramMessage(msg.chat.id, "Готово! Коды входа в Alontito теперь будут приходить сюда — бесплатно ✅");
+        } else {
+          await sendTelegramMessage(msg.chat.id, "Ссылка для привязки устарела. Открой новую прямо в приложении Alontito (Профиль → Telegram).");
+        }
+      } else {
+        await sendTelegramMessage(msg.chat.id, "Привет! Я бот Alontito — присылаю коды входа. Чтобы привязать аккаунт, открой ссылку из приложения (Профиль → Telegram).");
+      }
+    }
+  } catch (err) {
+    console.error("Ошибка Telegram-вебхука:", err);
+  }
+  res.status(200).end(); // Telegram ждёт быстрый 200, иначе будет слать повторно
+});
+
 function generateCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
-async function sendSms(phone, code) { console.log(`\n📱 [DEV-РЕЖИМ, identity-server] Код для ${phone}: ${code}\n`); }
+// ---------------------------------------------------------------------
+// Реальная отправка SMS через SMS.ru — простая регистрация для номеров РФ:
+// 1. Зарегистрируйся на sms.ru
+// 2. Пополни баланс (несколько рублей за SMS) или используй тестовый режим
+// 3. В личном кабинете: Настройки → API → скопируй api_id
+// 4. Впиши его в .env как SMSRU_API_ID
+//
+// Пока SMSRU_API_ID не задан — работает dev-режим (код печатается в консоль),
+// это нормально для локальной разработки/тестирования.
+// ---------------------------------------------------------------------
+// Доставка кода: Telegram-бот (бесплатно навсегда, если привязан) →
+// SMS.ru (если задан платный ключ) → dev-режим (бесплатно, код в консоли).
+async function sendSms(phone, code) {
+  const phoneHash = hashPhone(phone);
+  const r = await pool.query("SELECT telegram_chat_id FROM identities WHERE phone_hash = $1", [phoneHash]);
+  const chatId = r.rows[0]?.telegram_chat_id;
+
+  if (chatId) {
+    const sent = await sendTelegramMessage(chatId, `Код входа в Alontito: ${code}`);
+    if (sent) return;
+    console.error("Не удалось отправить код через Telegram, пробуем запасной вариант");
+  }
+
+  const apiId = process.env.SMSRU_API_ID;
+  if (!apiId) {
+    console.log(`\n📱 [DEV-РЕЖИМ, identity-server] Код для ${phone}: ${code}\n`);
+    return;
+  }
+  try {
+    const digits = phone.replace(/\D/g, ""); // SMS.ru ждёт номер без "+", только цифры
+    const msg = encodeURIComponent(`Код входа в Alontito: ${code}`);
+    const url = `https://sms.ru/sms/send?api_id=${apiId}&to=${digits}&msg=${msg}&json=1`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.status !== "OK" || data.sms?.[digits]?.status !== "OK") {
+      console.error("Ошибка отправки SMS через SMS.ru:", JSON.stringify(data));
+      console.log(`\n📱 [FALLBACK] Код для ${phone}: ${code}\n`); // чтобы не потерять доступ, если провайдер подвёл
+    }
+  } catch (err) {
+    console.error("Ошибка запроса к SMS.ru:", err);
+    console.log(`\n📱 [FALLBACK] Код для ${phone}: ${code}\n`);
+  }
+}
 
 const ADJ = ["swift", "quiet", "bright", "calm", "bold", "quick", "warm", "cool", "sharp", "kind"];
 const NOUN = ["fox", "wave", "spark", "cloud", "river", "ember", "comet", "maple", "hawk", "pine"];
@@ -204,6 +278,30 @@ setInterval(() => {
   for (const [t, s] of vaultSessions) if (s.expiresAt < now) vaultSessions.delete(t);
 }, 60000).unref();
 
+// ============================================================
+// Telegram — бесплатная навсегда доставка кода вместо платных SMS
+// ============================================================
+
+app.post("/internal/telegram/link-init", requireUser, async (req, res) => {
+  if (!isTelegramConfigured()) return res.status(503).json({ error: "Telegram-бот не настроен на сервере" });
+  const r = await pool.query("SELECT phone_enc FROM identities WHERE id = $1", [req.userId]);
+  const phone = decryptPhone(r.rows[0].phone_enc);
+  const phoneHash = hashPhone(phone);
+  const code = Buffer.from(`${Date.now()}-${Math.random()}-${req.userId}`).toString("hex").slice(0, 24);
+  await pool.query("INSERT INTO telegram_link_codes (code, phone_hash, expires_at) VALUES ($1, $2, $3)", [code, phoneHash, new Date(Date.now() + 10 * 60 * 1000)]);
+  res.json({ deepLink: telegramDeepLink(code) });
+});
+
+app.get("/internal/telegram/status", requireUser, async (req, res) => {
+  const r = await pool.query("SELECT telegram_chat_id FROM identities WHERE id = $1", [req.userId]);
+  res.json({ linked: Boolean(r.rows[0]?.telegram_chat_id), configured: isTelegramConfigured() });
+});
+
+app.post("/internal/telegram/unlink", requireUser, async (req, res) => {
+  await pool.query("UPDATE identities SET telegram_chat_id = NULL WHERE id = $1", [req.userId]);
+  res.json({ ok: true });
+});
+
 app.get("/internal/vault/status", requireUser, async (req, res) => {
   const r = await pool.query("SELECT vault_password_hash FROM identities WHERE id = $1", [req.userId]);
   res.json({ isSetup: Boolean(r.rows[0]?.vault_password_hash) });
@@ -241,28 +339,46 @@ app.post("/internal/vault/request-code", requireUser, async (req, res) => {
 });
 
 app.post("/internal/vault/unlock", requireUser, async (req, res) => {
-  const { password, code } = req.body;
+  const { password, code, deviceToken } = req.body;
   const r = await pool.query("SELECT phone_enc, vault_password_hash FROM identities WHERE id = $1", [req.userId]);
   const row = r.rows[0];
   if (!row?.vault_password_hash) return res.status(400).json({ error: "Хранилище ещё не настроено" });
   if (!bcrypt.compareSync(password || "", row.vault_password_hash)) return res.status(401).json({ error: "Неверный пароль хранилища" });
 
-  const phone = decryptPhone(row.phone_enc);
-  const phoneHash = hashPhone(phone);
-  const otpRes = await pool.query("SELECT * FROM otp_codes WHERE phone_hash = $1", [phoneHash]);
-  const otp = otpRes.rows[0];
-  if (!otp || new Date(otp.expires_at) < new Date()) return res.status(401).json({ error: "Код истёк, запроси новый" });
-  if (otp.attempts >= MAX_OTP_ATTEMPTS) return res.status(429).json({ error: "Слишком много попыток" });
-  if (otp.code !== (code || "").trim()) {
-    await pool.query("UPDATE otp_codes SET attempts = attempts + 1 WHERE phone_hash = $1", [phoneHash]);
-    return res.status(401).json({ error: "Неверный код" });
+  // Пароль верный. Дальше — либо доверенное устройство (пропускаем SMS),
+  // либо обычная проверка кода.
+  let deviceTrusted = false;
+  if (deviceToken) {
+    try {
+      const payload = jwt.verify(deviceToken, JWT_SECRET);
+      deviceTrusted = payload.type === "vault_device" && payload.userId === req.userId;
+    } catch {
+      deviceTrusted = false;
+    }
   }
-  await pool.query("DELETE FROM otp_codes WHERE phone_hash = $1", [phoneHash]);
+
+  if (!deviceTrusted) {
+    const phone = decryptPhone(row.phone_enc);
+    const phoneHash = hashPhone(phone);
+    const otpRes = await pool.query("SELECT * FROM otp_codes WHERE phone_hash = $1", [phoneHash]);
+    const otp = otpRes.rows[0];
+    if (!otp || new Date(otp.expires_at) < new Date()) return res.status(401).json({ error: "Код истёк, запроси новый" });
+    if (otp.attempts >= MAX_OTP_ATTEMPTS) return res.status(429).json({ error: "Слишком много попыток" });
+    if (otp.code !== (code || "").trim()) {
+      await pool.query("UPDATE otp_codes SET attempts = attempts + 1 WHERE phone_hash = $1", [phoneHash]);
+      return res.status(401).json({ error: "Неверный код" });
+    }
+    await pool.query("DELETE FROM otp_codes WHERE phone_hash = $1", [phoneHash]);
+  }
 
   const key = deriveVaultKey(password, req.userId);
   const vaultToken = Buffer.from(`${Date.now()}-${Math.random()}`).toString("hex").slice(0, 48);
   vaultSessions.set(vaultToken, { key, userId: req.userId, expiresAt: Date.now() + SESSION_TTL_MS });
-  res.json({ vaultToken, expiresInSeconds: SESSION_TTL_MS / 1000 });
+
+  // Новый/обновлённый токен доверенного устройства — 90 дней, без него в следующий раз снова спросят SMS-код
+  const newDeviceToken = jwt.sign({ userId: req.userId, type: "vault_device" }, JWT_SECRET, { expiresIn: "90d" });
+
+  res.json({ vaultToken, expiresInSeconds: SESSION_TTL_MS / 1000, deviceToken: newDeviceToken });
 });
 
 function vaultAuth(req, res, next) {
@@ -304,5 +420,8 @@ if (!INTERNAL_API_KEY) {
 }
 
 initDb()
-  .then(() => http.createServer(app).listen(PORT, () => console.log(`identity-server запущен на порту ${PORT}`)))
+  .then(async () => {
+    await registerWebhookIfNeeded();
+    http.createServer(app).listen(PORT, () => console.log(`identity-server запущен на порту ${PORT}`));
+  })
   .catch((err) => { console.error("Не удалось подключиться к базе данных:", err); process.exit(1); });

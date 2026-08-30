@@ -1,6 +1,6 @@
 {
   "name": "identity-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "R_stepanov",
   "type": "module",
   "main": "server.js",
