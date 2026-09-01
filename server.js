@@ -237,13 +237,18 @@ app.get("/internal/users/search", async (req, res) => {
   res.json(r.rows);
 });
 
-app.patch("/internal/users/:id/username", async (req, res) => {
+app.patch("/internal/users/:id/username", requireUser, async (req, res) => {
+  if (Number(req.params.id) !== req.userId) return res.status(403).json({ error: "Можно менять только свой юзернейм" });
   const username = (req.body.username || "").trim();
   if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: "Юзернейм: 3-20 символов" });
   const taken = await pool.query("SELECT 1 FROM identities WHERE username = $1 AND id != $2", [username, req.params.id]);
   if (taken.rows.length) return res.status(409).json({ error: "Юзернейм уже занят" });
-  await pool.query("UPDATE identities SET username = $1 WHERE id = $2", [username, req.params.id]);
-  res.json({ ok: true, username });
+  const upd = await pool.query("UPDATE identities SET username = $1 WHERE id = $2 RETURNING username", [username, req.params.id]);
+  if (!upd.rows.length) {
+    console.error(`Не удалось сменить юзернейм: identity id=${req.params.id} не найден`);
+    return res.status(404).json({ error: "Пользователь не найден" });
+  }
+  res.json({ ok: true, username: upd.rows[0].username });
 });
 
 app.get("/internal/users/:id/phone", requireUser, async (req, res) => {
