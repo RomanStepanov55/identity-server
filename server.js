@@ -222,12 +222,6 @@ function requireUser(req, res, next) {
 }
 
 // ---------- Профиль: юзернейм, свой номер (только себе, замаскированный) ----------
-app.get("/internal/users/:id", async (req, res) => {
-  const r = await pool.query("SELECT id, username, phone_hint FROM identities WHERE id = $1", [req.params.id]);
-  if (!r.rows.length) return res.status(404).json({ error: "not found" });
-  res.json(r.rows[0]);
-});
-
 app.get("/internal/users/search", async (req, res) => {
   const q = `%${(req.query.q || "").replace(/[\s()-]/g, "")}%`;
   const r = await pool.query(
@@ -235,6 +229,12 @@ app.get("/internal/users/search", async (req, res) => {
     [q, hashPhone((req.query.q || "").replace(/[\s()-]/g, ""))]
   );
   res.json(r.rows);
+});
+
+app.get("/internal/users/:id", async (req, res) => {
+  const r = await pool.query("SELECT id, username, phone_hint FROM identities WHERE id = $1", [req.params.id]);
+  if (!r.rows.length) return res.status(404).json({ error: "not found" });
+  res.json(r.rows[0]);
 });
 
 app.patch("/internal/users/:id/username", requireUser, async (req, res) => {
