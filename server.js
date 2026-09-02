@@ -20,7 +20,7 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors()); // сюда всё равно не достучаться без internalOnly-ключа ниже
 app.use(express.json({ limit: "1mb" }));
 
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false });
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500, standardHeaders: true, legacyHeaders: false });
 app.use(limiter);
 
 // ---------------------------------------------------------------------
